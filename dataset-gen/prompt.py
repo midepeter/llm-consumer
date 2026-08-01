@@ -1,6 +1,6 @@
 """
 Chain-of-Thought Knowledge Distillation Pipeline
-Teacher model: Qwen3 Coder Next via HuggingFace Inference API
+Teacher model: Qwen3 Coder Next via a configurable inference backend
 
 Flow:
   load_prompts()  →  clean_prompts()  →  generate_rationale()  →  save_dataset()
@@ -15,7 +15,10 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from huggingface_hub import InferenceClient
+from huggingface_hub.utils import HfHubHTTPError
+from openai import OpenAIError
+
+from inference import build_inference_client, thinking_extra_body, validate_model_access
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,8 +30,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-HF_TOKEN        = os.getenv("HF_TOKEN", "")
-TEACHER_MODEL   = "Qwen/Qwen3-Coder"          # update to exact HF model id
+TEACHER_MODEL   = os.getenv("TEACHER_MODEL", "")
 MAX_NEW_TOKENS  = 2048
 TEMPERATURE     = 0.6
 OUTPUT_FILE     = Path("dataset.jsonl")
@@ -144,17 +146,18 @@ def clean_prompts(prompts: list[str], deduplicate: bool = True) -> list[str]:
 # 3. Teacher Model — Chain-of-Thought generation
 # ---------------------------------------------------------------------------
 
-def build_client() -> InferenceClient:
-    if not HF_TOKEN:
+def build_client() -> Any:
+    if not TEACHER_MODEL.strip():
         raise EnvironmentError(
-            "HF_TOKEN environment variable is not set. "
-            "Export your HuggingFace token before running."
+            "TEACHER_MODEL is not set. Provide the model ID served by the selected backend."
         )
-    return InferenceClient(token=HF_TOKEN)
+    client = build_inference_client()
+    validate_model_access(client, TEACHER_MODEL)
+    return client
 
 
 def generate_rationale(
-    client: InferenceClient,
+    client: Any,
     prompt: str,
     retries: int = 3,
     backoff: float = 5.0,
@@ -178,15 +181,42 @@ def generate_rationale(
                 messages=messages,
                 max_tokens=MAX_NEW_TOKENS,
                 temperature=TEMPERATURE,
+                extra_body=thinking_extra_body(
+                    int(os.getenv("THINKING_BUDGET", "1024"))
+                ),
             )
-            raw = response.choices[0].message.content.strip()
-            thinking, answer = _parse_cot_output(raw)
+            message = response.choices[0].message
+            answer = (message.content or "").strip()
+            thinking = (getattr(message, "reasoning_content", None) or "").strip()
+            if thinking:
+                raw = f"<think>\n{thinking}\n</think>\n{answer}"
+            else:
+                raw = answer
+                thinking, answer = _parse_cot_output(raw)
             return {
                 "prompt":   prompt,
                 "thinking": thinking,
                 "answer":   answer,
                 "raw":      raw,
             }
+        except (HfHubHTTPError, OpenAIError) as exc:
+            response = getattr(exc, "response", None)
+            if response is not None and response.status_code == 404:
+                raise ValueError(
+                    f"Teacher model '{TEACHER_MODEL}' was not found by the configured backend."
+                ) from exc
+            logger.warning("Attempt %d/%d failed: %s", attempt, retries, exc)
+            if attempt < retries:
+                time.sleep(backoff * attempt)
+            else:
+                logger.error("All retries exhausted for prompt: %s…", prompt[:60])
+                return {
+                    "prompt":   prompt,
+                    "thinking": "",
+                    "answer":   "",
+                    "raw":      "",
+                    "error":    str(exc),
+                }
         except Exception as exc:
             logger.warning("Attempt %d/%d failed: %s", attempt, retries, exc)
             if attempt < retries:

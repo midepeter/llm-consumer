@@ -25,7 +25,10 @@ import os
 import time
 from typing import Any
 
-from huggingface_hub import InferenceClient
+from huggingface_hub.utils import HfHubHTTPError
+from openai import OpenAIError
+
+from inference import build_inference_client, validate_model_access
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +36,7 @@ logger = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
-HF_TOKEN              = os.getenv("HF_TOKEN", "")
-JUDGE_MODEL           = os.getenv("JUDGE_MODEL", "Qwen/Qwen3-Coder")
+JUDGE_MODEL           = os.getenv("JUDGE_MODEL", os.getenv("TEACHER_MODEL", ""))
 SYNTHETIC_PASS_THRESHOLD = float(os.getenv("PASS_THRESHOLD", "3.0"))   # out of 5.0
 RULE_WEIGHT           = 0.40   # weight of rule-based score in final score
 LLM_WEIGHT            = 0.60   # weight of LLM-judge score in final score
@@ -48,15 +50,16 @@ REFUSAL_PATTERNS = re.compile(
 JUDGE_SYSTEM_PROMPT = """\
 You are a strict but fair dataset quality evaluator for a code reasoning dataset.
 
-Given a PROMPT and a RESPONSE (which may include a <think> chain-of-thought block
-followed by a final answer), score the response on the following rubric and reply
-with ONLY valid JSON — no extra text.
+Given a PROMPT, an optional REFERENCE ANSWER, and a RESPONSE (which may include
+a <think> chain-of-thought block followed by a final answer), score the response
+on the following rubric and reply with ONLY valid JSON — no extra text.
 
 Rubric (each dimension 1-5):
   reasoning_depth   : Is the thinking thorough, correct, and step-by-step?
   answer_quality    : Is the final answer correct, complete, and directly addresses the prompt?
   code_quality      : (for coding tasks) Is the code syntactically valid and idiomatic? Rate 3 if N/A.
   no_hallucination  : Does the response avoid fabricating facts / APIs? (5 = no hallucinations)
+  reference_alignment: When a reference answer is provided, is the response materially consistent with it? Rate 3 if N/A.
 
 Reply format (JSON only):
 {
@@ -140,7 +143,7 @@ def rule_based_score(record: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def llm_judge_score(
-    client: InferenceClient,
+    client: Any,
     record: dict[str, Any],
     retries: int = 2,
     backoff: float = 4.0,
@@ -152,11 +155,18 @@ def llm_judge_score(
       llm_critique     : str
     """
     prompt   = record.get("prompt", "")
-    response = record.get("raw",    "")
+    response = record.get("raw", "")
+    reference_answer = record.get("reference_answer", "")
+    reference_section = (
+        f"\n\nREFERENCE ANSWER (validation only):\n{reference_answer}"
+        if reference_answer
+        else ""
+    )
 
     user_message = (
         f"PROMPT:\n{prompt}\n\n"
-        f"RESPONSE:\n{response}\n\n"
+        f"RESPONSE:\n{response}"
+        f"{reference_section}\n\n"
         "Evaluate and reply with JSON only."
     )
 
@@ -186,6 +196,15 @@ def llm_judge_score(
                 "llm_dimensions": numeric,
                 "llm_critique":   dims.get("critique", ""),
             }
+        except (HfHubHTTPError, OpenAIError) as exc:
+            response = getattr(exc, "response", None)
+            if response is not None and response.status_code == 404:
+                raise ValueError(
+                    f"Judge model '{JUDGE_MODEL}' was not found by the configured backend."
+                ) from exc
+            logger.warning("LLM judge attempt %d/%d failed: %s", attempt, retries, exc)
+            if attempt < retries:
+                time.sleep(backoff)
         except Exception as exc:
             logger.warning("LLM judge attempt %d/%d failed: %s", attempt, retries, exc)
             if attempt < retries:
@@ -200,7 +219,7 @@ def llm_judge_score(
 # ---------------------------------------------------------------------------
 
 def evaluate_synthetic_record(
-    client: InferenceClient,
+    client: Any,
     record: dict[str, Any],
     skip_llm_judge: bool = False,
 ) -> dict[str, Any]:
@@ -211,7 +230,14 @@ def evaluate_synthetic_record(
     rule_result = rule_based_score(record)
     rule_score  = rule_result["rule_score"]
 
-    if skip_llm_judge:
+    if record.get("error") or not record.get("answer", "").strip():
+        llm_result = {
+            "llm_score": 0.0,
+            "llm_dimensions": {},
+            "llm_critique": "generation_failed",
+        }
+        llm_score = 0.0
+    elif skip_llm_judge:
         llm_result = {"llm_score": 3.0, "llm_dimensions": {}, "llm_critique": "skipped"}
         llm_score  = 3.0
     else:
@@ -219,7 +245,11 @@ def evaluate_synthetic_record(
         llm_score  = llm_result["llm_score"]
 
     final_score = round(RULE_WEIGHT * rule_score + LLM_WEIGHT * llm_score, 3)
-    passed      = final_score >= SYNTHETIC_PASS_THRESHOLD
+    passed      = (
+        not record.get("error")
+        and bool(record.get("answer", "").strip())
+        and final_score >= SYNTHETIC_PASS_THRESHOLD
+    )
 
     return {
         **record,
@@ -245,7 +275,11 @@ def evaluate_open_source_record(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_judge_client() -> InferenceClient:
-    if not HF_TOKEN:
-        raise EnvironmentError("HF_TOKEN environment variable is not set.")
-    return InferenceClient(token=HF_TOKEN)
+def build_judge_client() -> Any:
+    if not JUDGE_MODEL.strip():
+        raise EnvironmentError(
+            "JUDGE_MODEL is not set. Set JUDGE_MODEL or TEACHER_MODEL to a served model ID."
+        )
+    client = build_inference_client()
+    validate_model_access(client, JUDGE_MODEL)
+    return client
